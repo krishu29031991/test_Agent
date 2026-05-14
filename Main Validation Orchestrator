@@ -1,0 +1,144 @@
+# main.py
+import sys
+import json
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+from src.config import config
+from src.parser.excel_reader import MappingReader
+from src.parser.rule_parser import RuleParser
+from src.generator.query_generator import BigQueryGenerator
+from src.validator.gcp_connector import BigQueryConnector
+from src.validator.comparator import ResultComparator
+from src.validator.reporter import ValidationReporter
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class ETLValidator:
+    """Main ETL Validation Framework"""
+    
+    def __init__(self, mapping_file: str):
+        self.mapping_file = mapping_file
+        self.config = config
+        
+        # Initialize components
+        self.reader = MappingReader(mapping_file)
+        self.rule_parser = RuleParser(use_llm_fallback=config['validation'].USE_LLM_FALLBACK)
+        self.bq = BigQueryConnector(config)
+        self.reporter = ValidationReporter(config)
+        
+        # Load data
+        self.data = self.reader.read_all_sheets()
+        self.mappings = self.data['mappings']
+        self.table_joins = self.data['table_joins']
+        self.lookups = self.data['lookups']
+        
+        # Initialize query generator
+        self.query_gen = BigQueryGenerator(config, self.lookups, self.table_joins)
+        self.query_gen.rule_parser = self.rule_parser
+        
+    def run_validation(self, target_table: str = "RAYT_FMD_CONSOLIDATED") -> pd.DataFrame:
+        """Run full validation"""
+        logger.info("Starting ETL Validation...")
+        
+        # Step 1: Generate validation query
+        logger.info("Generating validation query...")
+        query = self.query_gen.generate_validation_query(self.mappings, target_table)
+        
+        # Save query for debugging
+        with open("generated_query.sql", "w") as f:
+            f.write(query)
+        logger.info("Query saved to generated_query.sql")
+        
+        # Step 2: Execute on BigQuery
+        logger.info("Executing validation query on BigQuery...")
+        results = self.bq.execute_query(query)
+        
+        # Step 3: Analyze results
+        logger.info("Analyzing validation results...")
+        summary = self.reporter.generate_summary(results)
+        
+        # Step 4: Generate report
+        report = self.reporter.generate_report(results, summary)
+        
+        # Step 5: Save results
+        self._save_results(results, summary)
+        
+        return results, summary
+    
+    def validate_single_column(self, column_name: str) -> pd.DataFrame:
+        """Validate a single column"""
+        column_mappings = [m for m in self.mappings if m.target_column == column_name]
+        
+        if not column_mappings:
+            logger.error(f"Column {column_name} not found in mappings")
+            return None
+        
+        # Generate query for single column
+        query = self.query_gen.generate_validation_query(column_mappings, "RAYT_FMD_CONSOLIDATED")
+        
+        return self.bq.execute_query(query)
+    
+    def _save_results(self, results: pd.DataFrame, summary: Dict):
+        """Save validation results"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save as CSV locally
+        results_file = f"validation_results_{timestamp}.csv"
+        results.to_csv(results_file, index=False)
+        logger.info(f"Results saved to {results_file}")
+        
+        # Upload to GCS/BigQuery if configured
+        if self.config['validation'].OUTPUT_FORMAT == 'bigquery':
+            self.bq.upload_results(results, f"results_{timestamp}")
+        
+        # Save summary
+        with open(f"summary_{timestamp}.json", "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+def main():
+    """Entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="ETL Validation Framework")
+    parser.add_argument("--mapping", required=True, help="Path to mapping Excel file")
+    parser.add_argument("--target-table", default="RAYT_FMD_CONSOLIDATED", help="Target table name")
+    parser.add_argument("--column", help="Validate single column only")
+    parser.add_argument("--suffix", help="Table suffix (_bq_load, _hist, _raw)")
+    parser.add_argument("--run-date", help="Run date for validation")
+    
+    args = parser.parse_args()
+    
+    # Override config with CLI args
+    if args.suffix:
+        config['gcp'].TABLE_SUFFIX = args.suffix
+    if args.run_date:
+        config['gcp'].RUN_DATE = args.run_date
+    
+    # Run validation
+    validator = ETLValidator(args.mapping)
+    
+    if args.column:
+        results = validator.validate_single_column(args.column)
+        print(results.head())
+    else:
+        results, summary = validator.run_validation(args.target_table)
+        
+        # Print summary
+        print("\n" + "="*50)
+        print("VALIDATION SUMMARY")
+        print("="*50)
+        print(f"Total rows compared: {summary['total_rows']}")
+        print(f"Mismatches: {summary['mismatches']}")
+        print(f"Missing in source: {summary['missing_in_source']}")
+        print(f"Missing in target: {summary['missing_in_target']}")
+        print(f"Match rate: {summary['match_rate']:.2%}")
+        print("="*50)
+
+if __name__ == "__main__":
+    main()
