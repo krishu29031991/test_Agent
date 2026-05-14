@@ -1,0 +1,97 @@
+# src/validator/gcp_connector.py
+from google.cloud import bigquery
+from google.cloud.exceptions import NotFound
+from typing import Dict, Any, List
+import pandas as pd
+from tenacity import retry, stop_after_attempt, wait_exponential
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class BigQueryConnector:
+    """Handle BigQuery operations"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.client = self._create_client()
+        
+    def _create_client(self):
+        """Create BigQuery client"""
+        if self.config['gcp'].CREDENTIALS_PATH:
+            return bigquery.Client.from_service_account_json(
+                self.config['gcp'].CREDENTIALS_PATH,
+                project=self.config['gcp'].PROJECT_ID,
+                location=self.config['gcp'].BQ_LOCATION
+            )
+        else:
+            # Use default credentials (for GCP environment)
+            return bigquery.Client(
+                project=self.config['gcp'].PROJECT_ID,
+                location=self.config['gcp'].BQ_LOCATION
+            )
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def execute_query(self, query: str) -> pd.DataFrame:
+        """Execute BigQuery query and return results as DataFrame"""
+        logger.info("Executing BigQuery query...")
+        
+        try:
+            # Configure job
+            job_config = bigquery.QueryJobConfig(
+                use_query_cache=True,
+                maximum_bytes_billed=10**10  # 10GB limit
+            )
+            
+            # Run query
+            query_job = self.client.query(query, job_config=job_config)
+            
+            # Wait for results
+            results = query_job.result(timeout=self.config['gcp'].BQ_JOB_TIMEOUT)
+            
+            # Convert to DataFrame
+            df = results.to_dataframe()
+            
+            logger.info(f"Query returned {len(df)} rows")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            raise
+    
+    def table_exists(self, dataset: str, table: str) -> bool:
+        """Check if table exists in BigQuery"""
+        table_ref = f"{self.config['gcp'].PROJECT_ID}.{dataset}.{table}"
+        try:
+            self.client.get_table(table_ref)
+            return True
+        except NotFound:
+            return False
+    
+    def get_table_schema(self, dataset: str, table: str) -> List[Dict]:
+        """Get table schema"""
+        table_ref = f"{self.config['gcp'].PROJECT_ID}.{dataset}.{table}"
+        table = self.client.get_table(table_ref)
+        
+        return [
+            {
+                'name': schema_field.name,
+                'type': schema_field.field_type,
+                'mode': schema_field.mode
+            }
+            for schema_field in table.schema
+        ]
+    
+    def upload_results(self, df: pd.DataFrame, table_name: str) -> None:
+        """Upload validation results to BigQuery"""
+        table_id = f"{self.config['gcp'].PROJECT_ID}.validation_results.{table_name}"
+        
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            autodetect=True
+        )
+        
+        job = self.client.load_table_from_dataframe(df, table_id, job_config=job_config)
+        job.result()
+        
+        logger.info(f"Uploaded {len(df)} rows to {table_id}")
