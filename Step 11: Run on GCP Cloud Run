@@ -1,0 +1,9 @@
+# Build and deploy to Cloud Run
+gcloud builds submit --tag gcr.io/your-project/etl-validator
+gcloud run deploy etl-validator \
+    --image gcr.io/your-project/etl-validator \
+    --platform managed \
+    --region us-central1 \
+    --memory 16Gi \
+    --timeout 3600 \
+    --set-env-vars="GCP_PROJECT_ID=your-project,USE_LLM_FALLBACK=false"
