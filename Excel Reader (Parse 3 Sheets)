@@ -1,0 +1,146 @@
+# src/parser/excel_reader.py
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Any
+from dataclasses import dataclass
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class MappingRule:
+    source_schema: str
+    source_table: str
+    source_column: str
+    source_data_type: str
+    source_nullability: str
+    source_pk_fk: str
+    target_schema: str
+    target_table: str
+    target_column: str
+    target_data_type: str
+    target_nullability: str
+    target_pk_fk: str
+    rule_description: str
+    rule_expression: str
+    is_lookup: bool = False
+    lookup_name: str = None
+
+class MappingReader:
+    """Read and parse the 3 Excel sheets"""
+    
+    def __init__(self, file_path: str):
+        self.file_path = Path(file_path)
+        self.mappings = []
+        self.table_joins = []
+        self.lookups = {}
+        
+    def read_all_sheets(self) -> Dict[str, Any]:
+        """Read all three sheets"""
+        logger.info(f"Reading mapping file: {self.file_path}")
+        
+        # Read Mapping sheet
+        mapping_df = pd.read_excel(self.file_path, sheet_name='Mapping')
+        self.mappings = self._parse_mappings(mapping_df)
+        
+        # Read Table Join sheet
+        join_df = pd.read_excel(self.file_path, sheet_name='Table join')
+        self.table_joins = self._parse_joins(join_df)
+        
+        # Read Lookups sheet
+        lookups_df = pd.read_excel(self.file_path, sheet_name='Lookups')
+        self.lookups = self._parse_lookups(lookups_df)
+        
+        return {
+            'mappings': self.mappings,
+            'table_joins': self.table_joins,
+            'lookups': self.lookups
+        }
+    
+    def _parse_mappings(self, df: pd.DataFrame) -> List[MappingRule]:
+        """Parse Mapping sheet into structured objects"""
+        mappings = []
+        
+        for _, row in df.iterrows():
+            # Check if this is a lookup mapping
+            is_lookup = False
+            lookup_name = None
+            
+            source_table = str(row.get('Source Table/Lookup', ''))
+            if 'Lookup' in source_table or source_table.strip() == 'Lookup':
+                is_lookup = True
+                # Extract lookup name from Rule Description
+                if pd.notna(row.get('Rule Description', '')):
+                    lookup_name = self._extract_lookup_name(str(row['Rule Description']))
+            
+            mapping = MappingRule(
+                source_schema=str(row.get('Source Schema', '')) if pd.notna(row.get('Source Schema')) else None,
+                source_table=source_table,
+                source_column=str(row.get('Source Column', '')) if pd.notna(row.get('Source Column')) else None,
+                source_data_type=str(row.get('Source Data Type', '')) if pd.notna(row.get('Source Data Type')) else None,
+                source_nullability=str(row.get('Source Nullability', '')) if pd.notna(row.get('Source Nullability')) else None,
+                source_pk_fk=str(row.get('Source PK/FK', '')) if pd.notna(row.get('Source PK/FK')) else None,
+                target_schema=str(row.get('Target Schema', '')) if pd.notna(row.get('Target Schema')) else None,
+                target_table=str(row.get('Target Table', '')) if pd.notna(row.get('Target Table')) else None,
+                target_column=str(row.get('Target Column', '')) if pd.notna(row.get('Target Column')) else None,
+                target_data_type=str(row.get('Target Data Type', '')) if pd.notna(row.get('Target Data Type')) else None,
+                target_nullability=str(row.get('Target Nullability', '')) if pd.notna(row.get('Target Nullability')) else None,
+                target_pk_fk=str(row.get('Target PK/FK', '')) if pd.notna(row.get('Target PK/FK')) else None,
+                rule_description=str(row.get('Rule Description', '')) if pd.notna(row.get('Rule Description')) else '',
+                rule_expression=str(row.get('Rule Expression', '')) if pd.notna(row.get('Rule Expression')) else '',
+                is_lookup=is_lookup,
+                lookup_name=lookup_name
+            )
+            mappings.append(mapping)
+        
+        logger.info(f"Parsed {len(mappings)} mapping rules")
+        return mappings
+    
+    def _parse_joins(self, df: pd.DataFrame) -> List[str]:
+        """Parse Table Join sheet - contains filter conditions"""
+        joins = []
+        
+        # The filter conditions are in column A
+        for _, row in df.iterrows():
+            filter_text = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ''
+            if filter_text and filter_text != 'FILTER':
+                joins.append(filter_text)
+        
+        logger.info(f"Parsed {len(joins)} join/filter conditions")
+        return joins
+    
+    def _parse_lookups(self, df: pd.DataFrame) -> Dict[str, dict]:
+        """Parse Lookups sheet into reusable lookup definitions"""
+        lookups = {}
+        
+        for _, row in df.iterrows():
+            lookup_name = str(row.get('Lookup Name', '')) if pd.notna(row.get('Lookup Name')) else None
+            if not lookup_name or lookup_name == 'nan':
+                continue
+                
+            lookups[lookup_name] = {
+                'lookup_table': str(row.get('Lookup Table', '')) if pd.notna(row.get('Lookup Table')) else None,
+                'lookup_source_tables': str(row.get('Lookup Source Tables', '')) if pd.notna(row.get('Lookup Source Tables')) else None,
+                'lookup_join': str(row.get('Lookup Join', '')) if pd.notna(row.get('Lookup Join')) else None,
+                'lookup_constraint': str(row.get('Lookup Constraint', '')) if pd.notna(row.get('Lookup Constraint')) else None
+            }
+        
+        logger.info(f"Parsed {len(lookups)} lookup definitions")
+        return lookups
+    
+    def _extract_lookup_name(self, rule_description: str) -> str:
+        """Extract lookup name from rule description"""
+        import re
+        # Pattern: "Lookup (Name)" or "perform Lookup(Name)"
+        patterns = [
+            r'Lookup\(([^)]+)\)',
+            r'Lookup\s+([^(]+?)(?:\s+and|\s+to|\s+$)',
+            r'perform\s+Lookup[:\s]+([^.\n]+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, rule_description, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return None
