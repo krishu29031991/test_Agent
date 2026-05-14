@@ -1,0 +1,17 @@
+# 1. Clone/setup project
+cd etl_validator
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Set up credentials
+# Download service account key from GCP
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
+
+# 4. Run validation
+python main.py --mapping "Untitled spreadsheet.xlsx" --suffix "bq_load"
+
+# 5. Validate single column
+python main.py --mapping "Untitled spreadsheet.xlsx" --column "DIM1"
