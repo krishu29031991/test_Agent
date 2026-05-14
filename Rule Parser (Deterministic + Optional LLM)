@@ -1,0 +1,183 @@
+# src/parser/rule_parser.py
+import re
+import logging
+from typing import Dict, Any, Optional
+from functools import lru_cache
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class RuleParser:
+    """Parse English rule descriptions into SQL logic"""
+    
+    def __init__(self, use_llm_fallback: bool = False):
+        self.use_llm_fallback = use_llm_fallback
+        self.llm = None
+        
+        if use_llm_fallback:
+            try:
+                # Optional: Load local LLM (Ollama)
+                import subprocess
+                self.llm = "ollama"  # Will call via subprocess
+            except Exception as e:
+                logger.warning(f"LLM not available: {e}")
+                self.use_llm_fallback = False
+        
+        # Pattern library for deterministic parsing
+        self.patterns = self._init_patterns()
+        
+    def _init_patterns(self):
+        return {
+            'conditional_simple': re.compile(
+                r'if\s+(\w+)\s*=\s*(\w+)\s+then\s+([\'\w]+)\s+else\s+([\'\w]+)',
+                re.IGNORECASE
+            ),
+            'conditional_complex': re.compile(
+                r'if\s+(\w+)\s*=\s*(\w+)\s+if\s+(\w+)\s*=\s*(\w+)\s+then\s+([\'\w]+)\s+else\s+([\'\w]+)\s+else\s+([\'\w]+)',
+                re.IGNORECASE
+            ),
+            'trim_chars': re.compile(
+                r'trim\s+away\s+the\s+last\s+(\d+)\s+characters?',
+                re.IGNORECASE
+            ),
+            'populate_field': re.compile(
+                r'populate\s+target\s+with\s+([\w_]+)\.([\w_]+)\.([\w_]+)',
+                re.IGNORECASE
+            ),
+            'fallback_lookup': re.compile(
+                r'If\s+step\s+\d+\s+[Rr]eturn\s+NULL,\s+then\s+perform\s+Lookup\(([^)]+)\)',
+                re.IGNORECASE
+            ),
+            'coalesce_pattern': re.compile(
+                r'If\s+([\w_]+)\s+from\s+Step\s+\d+\s+[Rr]eturn\s+NULL',
+                re.IGNORECASE
+            ),
+            'date_comparison': re.compile(
+                r"TO_DATE\('([^']+)','[^']+'\)\s*([><=]+)\s*'([^']+)'",
+                re.IGNORECASE
+            )
+        }
+    
+    @lru_cache(maxsize=500)
+    def parse(self, rule_description: str, rule_expression: str = "") -> Dict[str, Any]:
+        """Parse rule into structured SQL logic"""
+        
+        if not rule_description or rule_description == 'nan':
+            return {'type': 'direct', 'sql': None}
+        
+        # Try deterministic parsing first
+        result = self._deterministic_parse(rule_description)
+        
+        if result['confidence'] >= 0.7:
+            return result
+        
+        # If low confidence and LLM fallback enabled
+        if self.use_llm_fallback and self._is_complex_rule(rule_description):
+            return self._llm_parse(rule_description)
+        
+        # Default: treat as direct mapping with note
+        return {
+            'type': 'direct_with_note',
+            'sql': None,
+            'note': rule_description,
+            'confidence': 0.5
+        }
+    
+    def _deterministic_parse(self, text: str) -> Dict[str, Any]:
+        """Parse using regex patterns"""
+        
+        # Pattern 1: Complex conditional (like DIM1)
+        match = self.patterns['conditional_complex'].search(text)
+        if match:
+            col1, val1, col2, val2, then_val, else_val1, else_val2 = match.groups()
+            return {
+                'type': 'case_when',
+                'sql': f"""
+                    CASE 
+                        WHEN {col1} = '{val1}' AND {col2} = '{val2}' THEN '{then_val}'
+                        WHEN {col1} = '{val1}' THEN '{else_val1}'
+                        ELSE '{else_val2}'
+                    END
+                """,
+                'confidence': 0.95
+            }
+        
+        # Pattern 2: Simple conditional
+        match = self.patterns['conditional_simple'].search(text)
+        if match:
+            col, val, then_val, else_val = match.groups()
+            return {
+                'type': 'case_when',
+                'sql': f"CASE WHEN {col} = '{val}' THEN '{then_val}' ELSE '{else_val}' END",
+                'confidence': 0.9
+            }
+        
+        # Pattern 3: Trim characters
+        match = self.patterns['trim_chars'].search(text)
+        if match:
+            num_chars = match.group(1)
+            return {
+                'type': 'string_manipulation',
+                'sql': f"SUBSTR({{column}}, 1, LENGTH({{column}}) - {num_chars})",
+                'confidence': 0.85
+            }
+        
+        # Pattern 4: Populate from field (lookup result)
+        match = self.patterns['populate_field'].search(text)
+        if match:
+            schema, table, column = match.groups()
+            return {
+                'type': 'lookup_field',
+                'sql': f"{schema}.{table}.{column}",
+                'field_info': {'schema': schema, 'table': table, 'column': column},
+                'confidence': 0.9
+            }
+        
+        # Pattern 5: Fallback lookup (ENT_LONG_TERM_RATING style)
+        if 'return null' in text.lower() and 'lookup' in text.lower():
+            return {
+                'type': 'coalesce_lookups',
+                'sql': "COALESCE(lookup1.value, lookup2.value, NULL)",
+                'confidence': 0.85
+            }
+        
+        # Default
+        return {'type': 'unknown', 'sql': None, 'confidence': 0.3}
+    
+    def _llm_parse(self, rule_description: str) -> Dict[str, Any]:
+        """Parse using local LLM (Ollama)"""
+        try:
+            import subprocess
+            import json
+            
+            prompt = f"""Convert this ETL rule to SQL expression. Return only JSON.
+            
+Rule: {rule_description}
+
+Example output: {{"type": "case_when", "sql": "CASE WHEN condition THEN 'A' ELSE 'B' END"}}
+
+JSON:"""
+            
+            result = subprocess.run(
+                ['ollama', 'run', 'phi:3.7b-mini-instruct', prompt],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                llm_output = json.loads(result.stdout)
+                llm_output['confidence'] = 0.7
+                llm_output['used_llm'] = True
+                return llm_output
+        except Exception as e:
+            logger.error(f"LLM parsing failed: {e}")
+        
+        return {'type': 'unknown', 'sql': None, 'confidence': 0}
+    
+    def _is_complex_rule(self, text: str) -> bool:
+        """Determine if rule is complex enough for LLM"""
+        return (len(text) > 150 or 
+                text.count('if') > 2 or 
+                text.count('lookup') > 1 or
+                'step' in text.lower())
