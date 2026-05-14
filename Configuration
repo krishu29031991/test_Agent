@@ -1,0 +1,47 @@
+# src/config.py
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+from typing import Dict, Optional
+
+load_dotenv()
+
+class GCPConfig:
+    """GCP Configuration"""
+    PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-project-id")
+    DATASET_SOURCE = os.getenv("GCP_DATASET_SOURCE", "HDS_OWNER")
+    DATASET_TARGET = os.getenv("GCP_DATASET_TARGET", "MI_OWNER")
+    DATASET_LOOKUP = os.getenv("GCP_DATASET_LOOKUP", "MI_WAREHOUSE")
+    
+    # Dynamic table suffixes
+    TABLE_SUFFIX = os.getenv("TABLE_SUFFIX", "")  # _bq_load, _hist, _raw
+    RUN_DATE = os.getenv("RUN_DATE", "2026-05-14")
+    PREVIOUS_WORKING_DAY = os.getenv("PREVIOUS_WORKING_DAY", "2026-05-13")
+    
+    # Credentials (for local VSCode)
+    CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    
+    # BigQuery settings
+    BQ_LOCATION = os.getenv("BQ_LOCATION", "US")
+    BQ_JOB_TIMEOUT = int(os.getenv("BQ_JOB_TIMEOUT", "300"))
+
+class ValidationConfig:
+    """Validation Framework Configuration"""
+    MAPPING_FILE_PATH = os.getenv("MAPPING_FILE_PATH", "mapping.xlsx")
+    
+    # Processing settings
+    BATCH_SIZE = 50
+    MAX_RULES_CACHE = 500
+    USE_LLM_FALLBACK = os.getenv("USE_LLM_FALLBACK", "false").lower() == "true"
+    
+    # Output settings
+    OUTPUT_FORMAT = os.getenv("OUTPUT_FORMAT", "json")  # json, csv, bigquery
+    OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "etl-validation-results")
+    
+    # Validation thresholds
+    MAX_MISMATCH_ROWS = int(os.getenv("MAX_MISMATCH_ROWS", "1000"))
+
+config = {
+    "gcp": GCPConfig(),
+    "validation": ValidationConfig()
+}
