@@ -1,0 +1,15 @@
+# Local VSCode
+git clone <your-repo>
+cd etl_validator
+pip install -r requirements.txt
+export GOOGLE_APPLICATION_CREDENTIALS="key.json"
+python main.py --mapping "mapping.xlsx" --suffix "bq_load"
+
+# GCP Cloud Run
+gcloud builds submit --tag gcr.io/project/validator
+gcloud run deploy validator --image gcr.io/project/validator --memory 16Gi
+
+# Output
+# - generated_query.sql (for debugging)
+# - validation_results_*.csv (mismatches)
+# - summary_*.json (statistics)
