@@ -1,0 +1,26 @@
+# tests/test_validator.py
+import unittest
+from src.parser.excel_reader import MappingReader
+from src.parser.rule_parser import RuleParser
+
+class TestETLValidator(unittest.TestCase):
+    
+    def setUp(self):
+        self.parser = RuleParser()
+        
+    def test_conditional_rule(self):
+        rule = "if INTEREST_FIXFLOAT=FLO if INT_AVG_TYPE=O then populate 'O' ELSE populate 'R' ELSE populate 'B'"
+        result = self.parser.parse(rule)
+        
+        self.assertEqual(result['type'], 'case_when')
+        self.assertIn("CASE", result['sql'])
+        
+    def test_trim_rule(self):
+        rule = "Trim away the last 6 characters from MODEL_RUN_IDENTIFIER"
+        result = self.parser.parse(rule)
+        
+        self.assertEqual(result['type'], 'string_manipulation')
+        self.assertIn("SUBSTR", result['sql'])
+
+if __name__ == '__main__':
+    unittest.main()
