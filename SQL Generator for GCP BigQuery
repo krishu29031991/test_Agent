@@ -1,0 +1,210 @@
+# src/generator/query_generator.py
+from typing import List, Dict, Any
+from jinja2 import Template
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class BigQueryGenerator:
+    """Generate BigQuery SQL from parsed mappings"""
+    
+    def __init__(self, config: Dict, lookups: Dict, table_joins: List[str]):
+        self.config = config
+        self.lookups = lookups
+        self.table_joins = table_joins
+        self.rule_parser = None  # Will be injected
+        
+    def generate_validation_query(self, mappings: List, target_table: str) -> str:
+        """Generate complete validation query"""
+        
+        # Build SELECT clause with all columns
+        select_clauses = []
+        for mapping in mappings:
+            select_sql = self._build_column_expression(mapping)
+            select_clauses.append(f"  {select_sql} AS {mapping.target_column}")
+        
+        # Build FROM clause with joins
+        from_clause = self._build_from_clause(mappings)
+        
+        # Build WHERE clause
+        where_clause = self._build_where_clause()
+        
+        query = f"""
+        WITH source_data AS (
+            SELECT 
+                {',\n'.join(select_clauses)}
+            FROM {from_clause}
+            WHERE {where_clause}
+        ),
+        target_data AS (
+            SELECT 
+                {', '.join([m.target_column for m in mappings if not m.is_lookup])}
+            FROM `{self.config['gcp'].PROJECT_ID}.{self.config['gcp'].DATASET_TARGET}.{target_table}`
+            WHERE SNAPSHOT_DATE = '{self.config['gcp'].RUN_DATE}'
+        )
+        SELECT 
+            COALESCE(s.hash_key, t.hash_key) as row_identifier,
+            s.* EXCEPT(hash_key),
+            t.* EXCEPT(hash_key),
+            CASE 
+                WHEN s.hash_key IS NULL THEN 'MISSING_IN_SOURCE'
+                WHEN t.hash_key IS NULL THEN 'MISSING_IN_TARGET'
+                ELSE 'MATCH'
+            END as validation_status
+        FROM source_data s
+        FULL OUTER JOIN target_data t 
+            ON s.hash_key = t.hash_key
+        WHERE s.hash_key IS NULL OR t.hash_key IS NULL 
+           OR s.{mappings[0].target_column} != t.{mappings[0].target_column}
+        """
+        
+        return query
+    
+    def _build_column_expression(self, mapping) -> str:
+        """Build SQL expression for a single column"""
+        
+        if mapping.is_lookup:
+            return self._build_lookup_expression(mapping)
+        
+        if mapping.rule_expression and mapping.rule_expression.strip():
+            return mapping.rule_expression
+        
+        # Parse rule description
+        parsed = self.rule_parser.parse(
+            mapping.rule_description, 
+            mapping.rule_expression
+        )
+        
+        if parsed['type'] == 'case_when':
+            return parsed['sql']
+        elif parsed['type'] == 'direct':
+            return f"src.{mapping.source_column}"
+        else:
+            # Default direct mapping
+            return f"src.{mapping.source_column}"
+    
+    def _build_lookup_expression(self, mapping) -> str:
+        """Build lookup subquery expression"""
+        
+        if not mapping.lookup_name or mapping.lookup_name not in self.lookups:
+            return "NULL"
+        
+        lookup = self.lookups[mapping.lookup_name]
+        
+        # Build lookup subquery
+        lookup_sql = f"""
+        (
+            SELECT {self._extract_return_column(lookup)}
+            FROM `{self.config['gcp'].PROJECT_ID}.{lookup['lookup_table']}`
+            WHERE {lookup['lookup_join']}
+              AND {lookup['lookup_constraint']}
+            LIMIT 1
+        )
+        """
+        
+        return lookup_sql
+    
+    def _build_from_clause(self, mappings) -> str:
+        """Build FROM clause with all necessary joins"""
+        
+        # Get unique source tables
+        source_tables = set()
+        for mapping in mappings:
+            if not mapping.is_lookup and mapping.source_table:
+                table_name = self._apply_suffix(mapping.source_table)
+                source_tables.add(f"`{self.config['gcp'].PROJECT_ID}.{mapping.source_schema}.{table_name}` AS {mapping.source_table}")
+        
+        from_clause = ",\n            ".join(source_tables)
+        
+        # Add join conditions from Table Join sheet
+        if self.table_joins:
+            from_clause += f"\n            WHERE {' AND '.join(self._process_join_conditions())}"
+        
+        return from_clause
+    
+    def _build_where_clause(self) -> str:
+        """Build WHERE clause from Table Join sheet"""
+        
+        conditions = []
+        
+        # Process Table Join conditions
+        for join_text in self.table_joins:
+            processed = self._process_join_condition(join_text)
+            conditions.append(processed)
+        
+        # Add run date filter
+        conditions.append(f"SNAPSHOT_DATE = '{self.config['gcp'].RUN_DATE}'")
+        
+        return " AND ".join(conditions)
+    
+    def _apply_suffix(self, table_name: str) -> str:
+        """Apply dynamic suffix to table name"""
+        suffix = self.config['gcp'].TABLE_SUFFIX
+        if suffix:
+            return f"{table_name}_{suffix}"
+        return table_name
+    
+    def _process_join_condition(self, condition: str) -> str:
+        """Process join condition with dynamic replacements"""
+        
+        # Replace 'Previous Working Day'
+        condition = condition.replace("'Previous Working Day'", f"'{self.config['gcp'].PREVIOUS_WORKING_DAY}'")
+        
+        # Replace subquery patterns
+        if "SELECT MAX(COB_DATE)" in condition:
+            condition = condition.replace(
+                "SELECT MAX(COB_DATE) FROM HDS_OWNER.PART_ORG_HIERARCHY",
+                f"SELECT MAX(COB_DATE) FROM `{self.config['gcp'].PROJECT_ID}.{self.config['gcp'].DATASET_SOURCE}.PART_ORG_HIERARCHY`"
+            )
+        
+        # Add table prefixes
+        condition = self._add_table_prefixes(condition)
+        
+        return condition
+    
+    def _add_table_prefixes(self, condition: str) -> str:
+        """Add proper table aliases to column references"""
+        
+        # Map table names to aliases
+        table_aliases = {
+            'SUMT_DMENV': 'dmenv',
+            'SUMT_DMASSET': 'dmasset',
+            'PART_ORG_HIERARCHY': 'hierarchy',
+            'RAYT_LOV_BANK_ENTITY': 'bank_entity'
+        }
+        
+        for table, alias in table_aliases.items():
+            condition = condition.replace(f"{table}.", f"{alias}.")
+        
+        return condition
+    
+    def _extract_return_column(self, lookup: Dict) -> str:
+        """Extract which column to return from lookup"""
+        # Parse lookup_table (e.g., "HDS_OWNER.APTT_SEE_MM")
+        table_parts = lookup['lookup_table'].split('.')
+        if len(table_parts) >= 2:
+            return f"{table_parts[-1]}.*"  # Return all columns for now
+        return "*"
+    
+    def _process_join_conditions(self) -> List[str]:
+        """Process all join conditions from Table Join sheet"""
+        processed = []
+        
+        for join_text in self.table_joins:
+            # Handle the MAX(AUDIT_VERSION) note
+            if 'MAX(SUMT_DMENV.AUDIT_VERSION)' in join_text:
+                processed.append("""
+                    dmenv.audit_version = (
+                        SELECT MAX(audit_version) 
+                        FROM `{project}.{dataset}.SUMT_DMENV` 
+                        WHERE tradeid = dmenv.tradeid
+                    )
+                """.format(
+                    project=self.config['gcp'].PROJECT_ID,
+                    dataset=self.config['gcp'].DATASET_SOURCE
+                ))
+            
+            processed.append(self._process_join_condition(join_text))
+        
+        return processed
